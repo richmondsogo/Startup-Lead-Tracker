@@ -1,6 +1,6 @@
 # Startup Lead Tracker (V2)
 
-An automated lead generation and scoring engine designed to discover high-intent contract, freelance, and automation opportunities for Python developers, scraping specialists, and indie builders.
+An automated lead generation, scoring, and 1-click outreach engine designed to discover high-intent contract, freelance, and automation opportunities for Python developers, scraping specialists, and indie builders.
 
 Rather than scraping generic news articles, this engine directly monitors platforms where founders, startups, and engineering managers actively post paid work, request developer help, or launch early products.
 
@@ -9,7 +9,7 @@ Rather than scraping generic news articles, this engine directly monitors platfo
 ## What Changed in V2? (The Strategic Shift)
 
 - **V1 (Passive News Discovery):** Relied on tech news RSS feeds (e.g., Techpoint Africa, TechCabal) scanning for keywords like *"raises seed round"*. While interesting, funding news rarely translates to immediate freelance work: contact details are missing, and companies that just raised institutional rounds usually hire full-time senior staff through formal recruiters.
-- **V2 (Active Hiring Intent & Scoring):** Prioritizes platforms where founders and technical leads explicitly ask for help right now—such as Hacker News monthly hiring threads, freelance seeker posts, Reddit hiring communities, and Show HN product launches. Every lead is evaluated by a multi-factor scoring engine (0–100) that ranks contract suitability, Python automation relevance, and budget plausibility.
+- **V2 (Active Hiring Intent & 1-Click Outreach):** Prioritizes platforms where founders and technical leads explicitly ask for help right now—such as Hacker News monthly hiring threads, freelance seeker posts, Reddit hiring communities, and Show HN product launches. Every lead is evaluated by a multi-factor scoring engine (0–100), enriched with publishing date tracking, equipped with an auto-generated cold pitch hook, and exported both to CSV and an interactive HTML outreach dashboard.
 
 ---
 
@@ -32,6 +32,7 @@ Rather than scraping generic news articles, this engine directly monitors platfo
 │  • Domain Cleaning: Strips out generic hosts (GitHub, Vercel, etc.)   │
 │  • Email Guesses: Generates plausible mailboxes (hello@, founders@)    │
 │  • GitHub Profile API: Resolves owner blog/email if only repo linked   │
+│  • Date Tracking: Extracts exact 'posted_at' date across all feeds     │
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │
                                     ▼
@@ -46,12 +47,12 @@ Rather than scraping generic news articles, this engine directly monitors platfo
                                     │
                                     ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│                   4. SAFE PERSISTENCE & CSV OUTPUT                     │
+│             4. 1-CLICK OUTREACH & MULTI-FORMAT EXPORT                  │
 │                                                                        │
-│  • Schema Migration Guard: Automatically archives V1 leads safely      │
-│  • Deduplication: Avoids duplicate rows across repeated runs           │
-│  • Sorted Output: Ranked descending by score (leads.csv)               │
-│  • Safe URLs: article_link strictly positioned as the last column      │
+│  • Tailored Pitch Hook: Context-aware 2-3 sentence personalized pitch  │
+│  • 1-Click Action Link: Pre-filled mailto: or Reddit compose URL       │
+│  • Interactive Dashboard: 'leads.html' with filters & search           │
+│  • Safe CSV Persistence: 'leads.csv' with deduplication & lock safety  │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -68,7 +69,25 @@ Every item retrieved passes through a deterministic scoring model tailored for a
 | **3. Stage & Team Fit** | **20** | • **+20 pts**: Small/early team (`solo founder`, `bootstrapped`, `seed`, `pre-seed`, `indie hacker`, `<10 people`).<br>• **+5 pts**: Neutral startup.<br>• **-20 pts penalty**: Large corporate/enterprise (`Series B-F`, `100+ employees`, `fortune 500`). |
 | **4. Budget Plausibility** | **15** | • **+15 pts**: Sweet spot budget mentioned (`$100-$500`, `$20-$50/hr`, `bounty`, `stipend`, `200/month`).<br>• **+5 pts**: Funded startup or established hiring thread.<br>• **-15 pts penalty**: Explicitly unpaid (`unpaid`, `equity-only`, `volunteer`). |
 
-Final scores are clamped between `0` and `100`. Each row includes a readable `score_breakdown` (e.g. `Intent:35|Skill:30|Stage:20|Budget:15`).
+Final scores are clamped between `0` and `100`. Each row includes a transparent `score_breakdown` (e.g. `Intent:35|Skill:30|Stage:20|Budget:15`).
+
+---
+
+## Innovations in V2
+
+### 1. Date Job Was Posted (`posted_at`)
+Distinguishes between when a lead was published (`posted_at`) and when our scanner scraped it (`found_at`). This lets you prioritize leads posted in the last 24–48 hours before other applicants flood the post.
+
+### 2. The 1-Click Outreach Engine
+Most cold outreach fails because of two friction points: crafting a personalized pitch and manually composing messages. 
+- **`tailored_pitch`**: Inspects the post content and automatically drafts an icebreaker pitch referencing their exact requirements (e.g., Python scraping, AI workflow automation, vector database support) and proposes a rapid 48-hour prototype for $150–$200.
+- **`quick_action`**: A pre-filled URL. Clicking it immediately opens your default mail client with `mailto:` or opens the Reddit message compose window with the author, subject, and tailored pitch already filled out!
+
+### 3. Interactive HTML Dashboard (`leads.html`)
+Alongside the CSV, the scanner automatically outputs a standalone, zero-dependency dark-mode visual board. You can filter by score (e.g., 60+), filter by contract type, search keywords in real time, copy pitches with one click, or trigger instant outreach.
+
+### 4. File-Lock Resilience (Windows-Safe)
+If `leads.csv` is currently open in Microsoft Excel or another viewer that locks the file exclusively, the script automatically catches the lock and saves to `leads_new.csv` with a helpful notice instead of crashing.
 
 ---
 
@@ -78,18 +97,15 @@ All sources are free, publicly accessible, and require no paid API keys or login
 
 1. **Hacker News "Who is hiring?"**
    - Official monthly thread posted on the 1st of every month by `whoishiring`.
-   - The script retrieves the active month's thread via the Algolia API, parses top-level comments, and identifies roles tagged with `Remote`, `Contract`, or `Part-time`.
+   - Parses top-level comments and identifies roles tagged with `Remote`, `Contract`, or `Part-time`.
 2. **Hacker News "Seeking freelancer?"**
-   - Monthly thread where clients and founders look for freelance help.
-   - Filters out freelancers offering services and highlights clients looking to hire.
+   - Monthly thread where clients and founders look for freelance contractors.
 3. **Hacker News Targeted Hiring Comments**
    - Real-time comment searches across all of Hacker News for phrases like `"seeking freelancer"`, `"hiring python"`, and `"looking for a developer"`.
 4. **Hacker News "Show HN"**
    - Real-time product launches from indie developers and early founders.
-   - Extracts founder websites, GitHub repositories, and contact info.
 5. **Reddit Public Hiring RSS**
    - Monitored feeds: `r/forhire` (filtered by `flair:Hiring python`), `r/jobbit`, and `r/SideProject`.
-   - Captures client posts with explicit budget figures and task scopes.
 6. **African Tech News (Optional, via `--include-news`)**
    - Techpoint Africa and TechCabal RSS feeds filtered for funding rounds and product launches.
 
@@ -97,21 +113,22 @@ All sources are free, publicly accessible, and require no paid API keys or login
 
 ## Output CSV Schema (`leads.csv`)
 
-The output is formatted for easy import into Google Sheets, Notion, Airtable, or manual review:
-
 | Column | Description |
 | :--- | :--- |
 | `score` | Numerical score from 0 to 100 based on the 4-factor scoring model. |
 | `score_breakdown` | Transparent breakdown: `Intent:X\|Skill:Y\|Stage:Z\|Budget:W`. |
 | `intent_type` | Category: `contract_hiring`, `fulltime_hiring`, `help_wanted`, or `discovery`. |
-| `found_at` | Date when the lead was discovered (`YYYY-MM-DD`). |
-| `source` | Source name (e.g., `HN Who is hiring`, `Reddit (r/forhire)`, `Show HN`). |
-| `company_or_author` | Company name or post author. |
+| `posted_at` | Date when the job or post was actually published (`YYYY-MM-DD`). |
+| `found_at` | Date when the scanner discovered the lead (`YYYY-MM-DD`). |
+| `source` | Source platform (e.g., `HN Who is hiring`, `Reddit (r/forhire)`, `Show HN`). |
+| `company_or_author` | Company name or Reddit/HN author handle. |
 | `title_or_role` | Headline, job title, or role summary. |
 | `domain` | Company's own website domain (cleaned; excluding generic hosts). |
 | `guessed_emails` | Generated contact mailboxes (`hello@`, `team@`, `founders@`, `contact@`, etc.). |
 | `other_contact` | Extracted direct emails, GitHub profiles, and Twitter/X handles. |
 | `summary_snippet` | Clean, stripped excerpt of the post text explaining what they need. |
+| `tailored_pitch` | Context-aware, pre-written personalized cold pitch hook. |
+| `quick_action` | Direct 1-click outreach link (`mailto:` or Reddit compose with pitch prefilled). |
 | `article_link` | Link to the original thread, post, or article (**strictly last column**). |
 
 > [!NOTE]
@@ -132,7 +149,7 @@ pip install -r requirements.txt
 
 ### 3. Run the Scanner
 
-Run with default settings (scans the past 7 days, filters for leads with score >= 20):
+Run with default settings (scans the past 7 days, filters for leads with score >= 20, generates `leads.csv` and `leads.html`):
 ```bash
 python tracker.py
 ```
@@ -149,7 +166,7 @@ python tracker.py --include-news
 
 Output to a custom file:
 ```bash
-python tracker.py --out my_weekly_leads.csv
+python tracker.py --out my_leads.csv --html my_dashboard.html
 ```
 
 ---
@@ -161,25 +178,17 @@ python tracker.py --out my_weekly_leads.csv
 | `--days` | `int` | `7` | Number of days back to search across feeds and APIs. |
 | `--min-score` | `int` | `20` | Minimum score threshold (0–100) required to save a lead to CSV. |
 | `--out` | `str` | `leads.csv` | Path of the destination CSV file. |
+| `--html` | `str` | `leads.html` | Path of the generated interactive HTML dashboard. |
+| `--no-html` | `flag` | `False` | Disable HTML dashboard generation. |
 | `--include-news` | `flag` | `False` | Also scan Techpoint and TechCabal RSS feeds. |
-
----
-
-## Safe Migration & Deduplication
-
-- **Deduplication:** The script loads all existing `article_link` entries in the output CSV before running. Re-running the script daily or weekly will only append brand-new, unseen leads.
-- **V1 Archive Protection:** If the script detects an existing `leads.csv` written in the older V1 format, it automatically copies the existing file to `leads_v1_archive.csv` so no past data is lost, before generating the new V2 file.
 
 ---
 
 ## Recommended Outreach Workflow
 
-1. **Sort & Scan:** Open `leads.csv` in Excel, Google Sheets, or VS Code. Focus on rows with `score >= 60`.
-2. **Review Snippet & Link:** Read `summary_snippet` to understand their exact pain point (e.g. *"need a scraper for real estate data"*, *"looking for someone to build an automated sync bot"*).
-3. **Check Contacts:** 
-   - Check `other_contact` first: If the founder provided a direct email or GitHub handle, use that directly.
-   - Check `guessed_emails` & `domain`: If only a domain is present, check their website's contact form or test `founders@<domain>` using a free email verifier.
-4. **Send a Tailored, Low-Risk Pitch:**
-   - Mention their specific post and problem.
-   - Highlight your Python/automation expertise.
-   - Offer a quick, low-cost proof-of-concept (e.g., *"I can build a working prototype script in 48 hours for $100-$200"*).
+1. **Open the Dashboard:** Open `leads.html` in any web browser.
+2. **Filter High-Fit Gigs:** Click the **"High Fit (60+)"** or **"Contract Only"** filter button.
+3. **Review & Reach Out:**
+   - Review the pre-written **Tailored Cold Pitch Hook**.
+   - Click **"⚡ 1-Click Outreach"** to immediately open a pre-filled email or Reddit compose message.
+   - Alternatively, click **"Copy Pitch"** to paste it into LinkedIn, Twitter/X, or an application form.
