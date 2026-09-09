@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
 """
-Startup Lead Tracker (V2 - Active Hiring Intent, Scoring & Outreach Engine)
+Startup Lead Tracker (V3 - Student-Focused Internship & Freelance Gig Finder)
 
 Scans public sources for startups, founders, and hiring managers with active
-intent for contract, freelance, and automation work (tailored for Python,
-scraping, bot, and LLM/automation gigs).
+intent for contract, freelance, internship, and junior/automation work (tailored
+for Python, scraping, bot, and LLM/automation gigs). Favours junior/internship
+roles and penalises senior-level positions to surface student-friendly opportunities.
 
 FEATURES & INNOVATIONS:
   1. Multi-Source Active Intent: HN "Who is hiring?", "Seeking freelancer",
-     real-time hiring comments, Show HN launches, and Reddit freelance RSS.
-  2. 4-Factor Deterministic Scoring Engine (0 - 100 pts) evaluating Intent,
-     Python Skill fit, Team stage, and Budget plausibility.
+     real-time hiring comments, Show HN launches, Reddit freelance RSS, and
+     intern-list.com (SWE, Data Analysis, AI/ML internships via Airtable embed).
+  2. Student-Aware Scoring Engine (0-100 pts): Intent, Python Skill fit, Stage,
+     Budget, Seniority Penalty (-30 for Senior/Staff/Lead roles), and
+     Junior/Intern Boost (+25 for Intern/Junior/Entry-Level roles).
   3. Lead Date Tracking: Captures 'posted_at' (when the post was published)
      alongside 'found_at'.
-  4. 1-Click Outreach Engine: Automatically crafts a tailored, high-converting
-     cold pitch hook for each lead and generates a pre-filled 'quick_action'
-     URL (mailto: or Reddit message compose) for instant outreach.
-  5. Interactive HTML Dashboard: Automatically exports a sleek, dark-mode
-     'leads.html' board with filters, real-time search, and 1-click pitch copying.
+  4. 1-Click Outreach Engine: Automatically crafts a tailored cold pitch /
+     student cover letter intro for each lead and generates a pre-filled
+     'quick_action' URL (mailto:, direct apply link, or Reddit compose).
+  5. Interactive HTML Dashboard: Dark-mode 'leads.html' with multi-column
+     sorting (Score, Posted Date, Found Date), filter tabs (Internships,
+     Contract, High Fit, Contact), Hide Senior Roles toggle, and expandable
+     score breakdown chips.
   6. Safe Deduplication & Migration: Preserves older CSV files through automated
      archival and avoids duplicates on re-runs.
 
@@ -91,11 +96,30 @@ HN_ALGOLIA_SEARCH = "https://hn.algolia.com/api/v1/search"
 
 HTTP_TIMEOUT = 12
 DEFAULT_HEADERS = {
-    "User-Agent": "StartupLeadTracker/2.0 (lead-generation-automation; +https://github.com)"
+    "User-Agent": "StartupLeadTracker/3.0 (lead-generation-automation; +https://github.com)"
 }
 REDDIT_HEADERS = {
-    "User-Agent": "python:StartupLeadTracker:v2.0 (by /u/dev_lead_tracker)"
+    "User-Agent": "python:StartupLeadTracker:v3.0 (by /u/dev_lead_tracker)"
 }
+
+# Intern-list.com Airtable shared-view embed IDs
+INTERN_LIST_EMBEDS = [
+    {
+        "name": "InternList (SWE)",
+        "app_id": "app17F0kkWQZhC6HB",
+        "share_id": "shrOTtndhc6HSgnYb",
+    },
+    {
+        "name": "InternList (Data)",
+        "app_id": "appbsiP1flCoaXCSm",
+        "share_id": "shreRS1cFLbduwBaU",
+    },
+    {
+        "name": "InternList (AI/ML)",
+        "app_id": "appjSXAWiVF4d1HoZ",
+        "share_id": "shrf04yGbrK3IebAl",
+    },
+]
 
 NEWS_RSS_SOURCES = [
     {"name": "Techpoint Africa", "url": "https://techpoint.africa/feed"},
@@ -261,38 +285,55 @@ def clean_company_guess(title):
 # Scoring Engine
 # ---------------------------------------------------------------------------
 
+# Keywords that signal a seniority mismatch for a student (penalty applied)
+SENIORITY_PENALTY_KEYWORDS = [
+    r"\bsenior\b", r"\bsr\.\b", r"\bstaff\b", r"\bprincipal\b",
+    r"\blead engineer\b", r"\blead developer\b", r"\bdirector\b",
+    r"\bvp of\b", r"\bvice president\b", r"\bhead of engineering\b",
+    r"\bhead of product\b", r"\barchitect\b",
+    r"\b5\+\s*years\b", r"\b7\+\s*years\b", r"\b10\+\s*years\b",
+    r"\bminimum 5 years\b", r"\bat least 5 years\b",
+]
+
+# Keywords that signal student / junior friendliness (boost applied)
+JUNIOR_BOOST_KEYWORDS = [
+    r"\bintern\b", r"\binternship\b", r"\bjunior\b", r"\bjr\.\b",
+    r"\bentry.?level\b", r"\bentry level\b", r"\bstudent\b",
+    r"\bnew grad\b", r"\bnewgrad\b", r"\bapprentice\b",
+    r"\bpart.?time\b", r"\bfresh graduate\b", r"\bno experience\b",
+    r"\bopen to grads\b",
+]
+
+
 def calculate_lead_score(lead):
     title = lead.get("title_or_role", "")
     snippet = lead.get("summary_snippet", "")
-    full_text = f"{title} {snippet}".lower()
     intent_type = lead.get("intent_type", "discovery")
     source = lead.get("source", "").lower()
+    full_text = f"{title} {snippet}".lower()
+
+    breakdown_parts = []
 
     # 1. Intent Score (Max 35 pts)
-    intent_score = 5
     contract_intent_patterns = [
-        r"\bseeking freelancer\b",
-        r"\[hiring\]",
-        r"\bcontract\b",
-        r"\bfreelance\b",
-        r"\bpart-time\b",
-        r"\bpart time\b",
-        r"\blooking to hire\b",
-        r"\bneed a freelancer\b",
-        r"\bhiring a contractor\b",
-        r"\bgig\b",
-        r"\bbounty\b",
+        r"\bseeking freelancer\b", r"\[hiring\]", r"\bcontract\b", r"\bfreelance\b",
+        r"\bpart-time\b", r"\bpart time\b", r"\blooking to hire\b",
+        r"\bneed a freelancer\b", r"\bhiring a contractor\b", r"\bgig\b", r"\bbounty\b",
     ]
-    if intent_type == "contract_hiring" or any(re.search(p, full_text) for p in contract_intent_patterns):
+    if intent_type in ("contract_hiring", "internship") or any(
+        re.search(p, full_text) for p in contract_intent_patterns
+    ):
         intent_score = 35
     elif intent_type == "fulltime_hiring" or "who is hiring" in source:
         intent_score = 20
     elif intent_type == "help_wanted" or any(
-        p in full_text for p in ["looking for help", "need help", "collaborator", "co-founder", "looking for developer"]
+        p in full_text
+        for p in ["looking for help", "need help", "collaborator", "co-founder", "looking for developer"]
     ):
         intent_score = 15
-    elif intent_type == "discovery":
+    else:
         intent_score = 5
+    breakdown_parts.append(f"Intent:+{intent_score}")
 
     # 2. Skill & Stack Relevance (Max 30 pts, Min -10 pts)
     tier1_keywords = [
@@ -300,7 +341,7 @@ def calculate_lead_score(lead):
         "automation", "automate", "bot", "ai", "llm", "gemini", "openai",
         "gpt", "fastapi", "flask", "django", "data extraction", "pipeline",
         "etl", "playwright", "selenium", "beautifulsoup", "bs4", "scripting",
-        "script",
+        "script", "data analysis", "machine learning", "ml",
     ]
     tier2_keywords = [
         "backend", "api", "full-stack", "fullstack", "database", "sqlite",
@@ -327,8 +368,11 @@ def calculate_lead_score(lead):
     elif tier2_hits == 1:
         skill_score = min(30, skill_score + 5)
 
-    if tier1_hits == 0 and any(re.search(r"\b" + re.escape(kw) + r"\b", full_text) for kw in disjoint_keywords):
+    if tier1_hits == 0 and any(
+        re.search(r"\b" + re.escape(kw) + r"\b", full_text) for kw in disjoint_keywords
+    ):
         skill_score = -10
+    breakdown_parts.append(f"Skill:{'+' if skill_score >= 0 else ''}{skill_score}")
 
     # 3. Stage & Team Size Fit (Max 20 pts, Min -20 pts)
     small_stage_patterns = [
@@ -338,37 +382,51 @@ def calculate_lead_score(lead):
     ]
     enterprise_patterns = [
         r"\bseries [b-f]\b", r"\b100\+\s*employees\b", r"\b50\+\s*employees\b",
-        r"\benterprise\b", r"\bfortune 500\b", r"\bdirector of\b", r"\bvp of\b",
+        r"\benterprise\b", r"\bfortune 500\b",
     ]
-
     stage_score = 5
     if any(re.search(p, full_text) for p in small_stage_patterns):
         stage_score = 20
     elif any(re.search(p, full_text) for p in enterprise_patterns):
         stage_score = -20
+    breakdown_parts.append(f"Stage:{'+' if stage_score >= 0 else ''}{stage_score}")
 
     # 4. Budget Plausibility (Max 15 pts, Min -15 pts)
-    budget_score = 0
     unpaid_patterns = [
         r"\bunpaid\b", r"\bequity-only\b", r"\bequity only\b", r"\bfree internship\b",
         r"\bno pay\b", r"\bvolunteer\b", r"\bno salary\b",
     ]
     sweet_budget_patterns = [
-        r"\$[1-9][0-9]{2}\b",        # $100 - $999
-        r"\$[1-5][0-9]\s*/\s*hr",    # $10 - $59 /hr
+        r"\$[1-9][0-9]{2}\b", r"\$[1-5][0-9]\s*/\s*hr",
         r"\bhourly rate\b", r"\bstipend\b", r"\bfixed price\b", r"\bbounty\b",
         r"\b200/month\b", r"\b200/mo\b", r"\b250\b",
     ]
-
+    budget_score = 0
     if any(re.search(p, full_text) for p in unpaid_patterns):
         budget_score = -15
     elif any(re.search(p, full_text) for p in sweet_budget_patterns):
         budget_score = 15
     elif "who is hiring" in source or "funding" in full_text:
         budget_score = 5
+    breakdown_parts.append(f"Budget:{'+' if budget_score >= 0 else ''}{budget_score}")
 
-    total_score = max(0, min(100, intent_score + skill_score + stage_score + budget_score))
-    breakdown = f"Intent:{intent_score}|Skill:{skill_score}|Stage:{stage_score}|Budget:{budget_score}"
+    # 5. Seniority Penalty (-30 for senior/staff/lead/director/architect roles)
+    seniority_penalty = 0
+    if any(re.search(p, full_text) for p in SENIORITY_PENALTY_KEYWORDS):
+        seniority_penalty = -30
+        breakdown_parts.append("Senior:-30")
+
+    # 6. Junior / Intern Boost (+25 for intern/junior/entry-level/student roles)
+    junior_boost = 0
+    if intent_type == "internship" or any(
+        re.search(p, full_text) for p in JUNIOR_BOOST_KEYWORDS
+    ):
+        junior_boost = 25
+        breakdown_parts.append("Junior/Intern:+25")
+
+    raw = intent_score + skill_score + stage_score + budget_score + seniority_penalty + junior_boost
+    total_score = max(0, min(100, raw))
+    breakdown = "|".join(breakdown_parts)
     return total_score, breakdown
 
 # ---------------------------------------------------------------------------
@@ -385,12 +443,30 @@ def generate_tailored_pitch(lead):
 
     clean_author = author.replace("/u/", "").replace("u/", "").strip()
     if clean_author and clean_author not in ["Unknown Company", "HN User", "Reddit User"]:
-        greeting = f"Hi {clean_author},"
+        greeting = f"Hi {clean_author} team,"
     else:
         greeting = "Hi there,"
 
     short_title = title[:60].strip().rstrip("-:| ")
 
+    # Student-specific: internship cover letter intro
+    if intent == "internship" or any(
+        re.search(p, full_text) for p in JUNIOR_BOOST_KEYWORDS
+    ):
+        if any(w in full_text for w in ["data", "analyst", "analysis", "sql", "excel", "dashboard"]):
+            focus = "data analysis, SQL querying, and Python-based pipeline automation"
+        elif any(w in full_text for w in ["ai", "ml", "machine learning", "llm", "nlp"]):
+            focus = "Python, machine learning workflows, and LLM integration"
+        else:
+            focus = "Python development, web scraping, and automation tooling"
+        return (
+            f"{greeting} I'm a self-taught developer currently studying and I'm excited to apply for the "
+            f"{short_title} role. I have hands-on experience in {focus}, and I'm eager to contribute "
+            f"from day one. I learn extremely fast, am comfortable working autonomously, and would love "
+            f"the chance to bring real value to your team this term. Looking forward to hearing from you!"
+        )
+
+    # Freelance / contract pitch
     if any(w in full_text for w in ["scraper", "scraping", "crawl", "data extraction"]):
         focus = "web scraping, crawler pipelines, and data extraction"
         offer = "I can deliver a clean, robust Python scraping script for your project within 48 hours for $150-$200."
@@ -1027,7 +1103,6 @@ def append_leads(csv_path, leads, min_score=0):
 # ---------------------------------------------------------------------------
 
 def export_html_dashboard(leads, html_path=DEFAULT_HTML_PATH):
-    # Sort descending by score
     sorted_leads = sorted(leads, key=lambda x: x.get("score", 0), reverse=True)
     leads_json = json.dumps(sorted_leads)
 
@@ -1042,9 +1117,9 @@ def export_html_dashboard(leads, html_path=DEFAULT_HTML_PATH):
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
   <style>
     :root {{
-      --bg: #0b0f19;
-      --card-bg: rgba(22, 28, 45, 0.85);
-      --card-border: rgba(255, 255, 255, 0.08);
+      --bg: #080c17;
+      --card-bg: rgba(16, 22, 38, 0.9);
+      --card-border: rgba(255, 255, 255, 0.07);
       --text: #e2e8f0;
       --text-muted: #94a3b8;
       --accent: #3b82f6;
@@ -1053,16 +1128,19 @@ def export_html_dashboard(leads, html_path=DEFAULT_HTML_PATH):
       --purple: #8b5cf6;
       --amber: #f59e0b;
       --rose: #f43f5e;
+      --teal: #14b8a6;
     }}
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{
       background: var(--bg);
+      background-image: radial-gradient(ellipse at 20% 50%, rgba(59,130,246,0.04) 0%, transparent 60%),
+                        radial-gradient(ellipse at 80% 20%, rgba(139,92,246,0.04) 0%, transparent 60%);
       color: var(--text);
       font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
       padding: 32px 20px;
       min-height: 100vh;
     }}
-    .container {{ max-width: 1200px; margin: 0 auto; }}
+    .container {{ max-width: 1240px; margin: 0 auto; }}
     header {{
       display: flex;
       justify-content: space-between;
@@ -1073,161 +1151,242 @@ def export_html_dashboard(leads, html_path=DEFAULT_HTML_PATH):
       padding-bottom: 24px;
       border-bottom: 1px solid var(--card-border);
     }}
-    .title h1 {{ font-size: 28px; font-weight: 700; color: #fff; letter-spacing: -0.5px; }}
-    .title p {{ color: var(--text-muted); font-size: 14px; margin-top: 4px; }}
+    .title h1 {{ font-size: 26px; font-weight: 700; color: #fff; letter-spacing: -0.5px; }}
+    .title h1 span {{ background: linear-gradient(135deg,#3b82f6,#8b5cf6); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }}
+    .title p {{ color: var(--text-muted); font-size: 13px; margin-top: 4px; }}
     .stats-bar {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-      gap: 16px;
-      margin-bottom: 28px;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 14px;
+      margin-bottom: 24px;
     }}
     .stat-card {{
       background: var(--card-bg);
       border: 1px solid var(--card-border);
       border-radius: 12px;
-      padding: 16px 20px;
+      padding: 14px 18px;
       backdrop-filter: blur(8px);
     }}
-    .stat-val {{ font-size: 26px; font-weight: 700; color: #fff; }}
-    .stat-label {{ font-size: 13px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }}
-    .controls {{
+    .stat-val {{ font-size: 24px; font-weight: 700; color: #fff; }}
+    .stat-label {{ font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.6px; margin-top: 2px; }}
+    .toolbar {{
       display: flex;
       flex-wrap: wrap;
-      gap: 12px;
-      margin-bottom: 24px;
+      gap: 10px;
+      margin-bottom: 20px;
       align-items: center;
-      justify-content: space-between;
     }}
-    .filter-group {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+    .filter-group {{ display: flex; gap: 6px; flex-wrap: wrap; flex: 1; }}
+    .sort-group {{ display: flex; align-items: center; gap: 8px; }}
+    .toggle-group {{ display: flex; align-items: center; gap: 8px; }}
     .btn {{
-      background: rgba(255, 255, 255, 0.05);
+      background: rgba(255, 255, 255, 0.04);
       border: 1px solid var(--card-border);
-      color: var(--text);
-      padding: 8px 16px;
+      color: var(--text-muted);
+      padding: 7px 14px;
       border-radius: 8px;
       cursor: pointer;
-      font-size: 14px;
+      font-size: 13px;
       font-weight: 500;
-      transition: all 0.2s;
+      transition: all 0.18s;
+      font-family: 'Outfit', sans-serif;
     }}
-    .btn:hover, .btn.active {{
-      background: var(--accent);
-      border-color: var(--accent);
-      color: #fff;
+    .btn:hover {{ background: rgba(59,130,246,0.12); border-color: rgba(59,130,246,0.4); color: #93c5fd; }}
+    .btn.active {{ background: rgba(59,130,246,0.2); border-color: var(--accent); color: #60a5fa; font-weight: 600; }}
+    .btn.active-green {{ background: rgba(16,185,129,0.15); border-color: #10b981; color: #34d399; font-weight: 600; }}
+    select.sort-select {{
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--card-border);
+      color: var(--text);
+      padding: 7px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-family: 'Outfit', sans-serif;
+      outline: none;
+      cursor: pointer;
+      appearance: none;
+      -webkit-appearance: none;
+      padding-right: 28px;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2394a3b8' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 10px center;
     }}
+    select.sort-select:focus {{ border-color: var(--accent); }}
     .search-input {{
-      background: rgba(255, 255, 255, 0.05);
+      background: rgba(255, 255, 255, 0.04);
       border: 1px solid var(--card-border);
       color: #fff;
-      padding: 10px 16px;
+      padding: 8px 14px;
       border-radius: 8px;
-      font-size: 14px;
-      width: 280px;
+      font-size: 13px;
+      font-family: 'Outfit', sans-serif;
+      min-width: 240px;
+      flex: 1;
+      max-width: 320px;
       outline: none;
     }}
-    .search-input:focus {{ border-color: var(--accent); }}
-    .leads-grid {{ display: flex; flex-direction: column; gap: 16px; }}
+    .search-input::placeholder {{ color: #475569; }}
+    .search-input:focus {{ border-color: var(--accent); background: rgba(59,130,246,0.05); }}
+    /* Toggle switch */
+    .toggle-label {{ font-size: 13px; color: var(--text-muted); white-space: nowrap; }}
+    .toggle-switch {{ position: relative; width: 40px; height: 22px; }}
+    .toggle-switch input {{ opacity: 0; width: 0; height: 0; }}
+    .slider {{
+      position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(255,255,255,0.1); border-radius: 22px; transition: 0.2s;
+      border: 1px solid var(--card-border);
+    }}
+    .slider:before {{
+      position: absolute; content: ''; height: 16px; width: 16px; left: 2px; bottom: 2px;
+      background: #94a3b8; border-radius: 50%; transition: 0.2s;
+    }}
+    .toggle-switch input:checked + .slider {{ background: rgba(16,185,129,0.3); border-color: #10b981; }}
+    .toggle-switch input:checked + .slider:before {{ transform: translateX(18px); background: #10b981; }}
+    /* Lead cards */
+    .leads-grid {{ display: flex; flex-direction: column; gap: 14px; }}
     .lead-card {{
       background: var(--card-bg);
       border: 1px solid var(--card-border);
       border-radius: 14px;
-      padding: 22px 24px;
+      padding: 20px 24px;
       backdrop-filter: blur(12px);
-      transition: transform 0.15s, border-color 0.15s;
+      transition: transform 0.15s, border-color 0.2s, box-shadow 0.2s;
     }}
     .lead-card:hover {{
-      border-color: rgba(59, 130, 246, 0.4);
-      transform: translateY(-2px);
+      border-color: rgba(59, 130, 246, 0.3);
+      transform: translateY(-1px);
+      box-shadow: 0 8px 32px rgba(0,0,0,0.3);
     }}
+    .lead-card.internship {{ border-left: 3px solid #14b8a6; }}
+    .lead-card.senior-role {{ opacity: 0.6; }}
     .card-header {{
       display: flex;
       justify-content: space-between;
       align-items: flex-start;
-      gap: 16px;
-      margin-bottom: 12px;
+      gap: 12px;
+      margin-bottom: 10px;
     }}
+    .badges-row {{ display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }}
     .badge {{
       display: inline-flex;
       align-items: center;
-      padding: 4px 10px;
-      border-radius: 6px;
-      font-size: 12px;
+      padding: 3px 9px;
+      border-radius: 5px;
+      font-size: 11px;
       font-weight: 600;
       font-family: 'JetBrains Mono', monospace;
+      white-space: nowrap;
     }}
     .badge-score-high {{ background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }}
     .badge-score-mid {{ background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); }}
-    .badge-score-low {{ background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }}
-    .badge-source {{ background: rgba(139, 92, 246, 0.15); color: #c084fc; border: 1px solid rgba(139, 92, 246, 0.3); }}
-    .card-title {{ font-size: 18px; font-weight: 600; color: #fff; line-height: 1.4; }}
+    .badge-score-low {{ background: rgba(245, 158, 11, 0.12); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.25); }}
+    .badge-source {{ background: rgba(139, 92, 246, 0.12); color: #c084fc; border: 1px solid rgba(139, 92, 246, 0.25); }}
+    .badge-internship {{ background: rgba(20, 184, 166, 0.12); color: #2dd4bf; border: 1px solid rgba(20,184,166,0.25); }}
+    .badge-senior {{ background: rgba(244, 63, 94, 0.1); color: #fb7185; border: 1px solid rgba(244,63,94,0.2); }}
+    /* Score breakdown chips */
+    .score-breakdown {{
+      display: flex;
+      gap: 5px;
+      flex-wrap: wrap;
+      margin-top: 6px;
+    }}
+    .chip {{
+      font-size: 10px;
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 600;
+    }}
+    .chip-pos {{ background: rgba(16,185,129,0.12); color: #6ee7b7; border: 1px solid rgba(16,185,129,0.2); }}
+    .chip-neg {{ background: rgba(244,63,94,0.1); color: #fca5a5; border: 1px solid rgba(244,63,94,0.2); }}
+    .chip-neutral {{ background: rgba(148,163,184,0.08); color: #94a3b8; border: 1px solid rgba(148,163,184,0.15); }}
+    .card-title {{ font-size: 16px; font-weight: 600; color: #fff; line-height: 1.4; }}
     .card-meta {{
       display: flex;
-      gap: 16px;
-      font-size: 13px;
+      gap: 14px;
+      font-size: 12px;
       color: var(--text-muted);
-      margin-top: 6px;
+      margin-top: 4px;
       flex-wrap: wrap;
     }}
     .snippet {{
-      font-size: 14px;
+      font-size: 13px;
       color: #cbd5e1;
       line-height: 1.6;
-      margin: 14px 0;
-      background: rgba(0, 0, 0, 0.2);
-      padding: 12px 14px;
+      margin: 12px 0;
+      background: rgba(0, 0, 0, 0.25);
+      padding: 10px 13px;
       border-radius: 8px;
     }}
     .pitch-box {{
-      background: rgba(59, 130, 246, 0.08);
-      border: 1px dashed rgba(59, 130, 246, 0.35);
+      background: rgba(59, 130, 246, 0.06);
+      border: 1px dashed rgba(59, 130, 246, 0.3);
       border-radius: 10px;
-      padding: 14px 16px;
-      margin: 14px 0;
+      padding: 12px 14px;
+      margin: 12px 0;
     }}
     .pitch-header {{
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 8px;
-      font-size: 12px;
+      margin-bottom: 7px;
+      font-size: 11px;
       font-weight: 600;
       color: #60a5fa;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.6px;
     }}
-    .pitch-text {{ font-size: 14px; color: #f1f5f9; line-height: 1.5; font-style: italic; }}
+    .pitch-text {{ font-size: 13px; color: #e2e8f0; line-height: 1.5; font-style: italic; }}
     .card-actions {{
       display: flex;
-      gap: 10px;
+      gap: 8px;
       align-items: center;
       flex-wrap: wrap;
-      margin-top: 14px;
+      margin-top: 12px;
     }}
     .btn-action {{
       display: inline-flex;
       align-items: center;
-      gap: 6px;
-      padding: 8px 16px;
+      gap: 5px;
+      padding: 7px 14px;
       border-radius: 8px;
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 600;
       text-decoration: none;
-      transition: background 0.2s;
+      transition: all 0.2s;
+      font-family: 'Outfit', sans-serif;
     }}
-    .btn-reachout {{ background: #2563eb; color: #fff; }}
-    .btn-reachout:hover {{ background: #1d4ed8; }}
-    .btn-copy {{ background: rgba(255, 255, 255, 0.08); color: #e2e8f0; border: 1px solid var(--card-border); cursor: pointer; }}
-    .btn-copy:hover {{ background: rgba(255, 255, 255, 0.15); }}
+    .btn-reachout {{ background: linear-gradient(135deg,#2563eb,#1d4ed8); color: #fff; }}
+    .btn-reachout:hover {{ background: linear-gradient(135deg,#1d4ed8,#1e40af); transform: translateY(-1px); }}
+    .btn-apply {{ background: linear-gradient(135deg,#0d9488,#0f766e); color: #fff; }}
+    .btn-apply:hover {{ background: linear-gradient(135deg,#0f766e,#115e59); transform: translateY(-1px); }}
+    .btn-copy {{
+      background: rgba(255, 255, 255, 0.06);
+      color: #e2e8f0;
+      border: 1px solid var(--card-border);
+      cursor: pointer;
+      font-family: 'Outfit', sans-serif;
+    }}
+    .btn-copy:hover {{ background: rgba(255, 255, 255, 0.12); }}
     .btn-link {{ background: transparent; color: var(--text-muted); border: 1px solid var(--card-border); }}
-    .btn-link:hover {{ color: #fff; border-color: rgba(255, 255, 255, 0.3); }}
+    .btn-link:hover {{ color: #fff; border-color: rgba(255, 255, 255, 0.25); }}
     .contact-tag {{
       display: inline-flex;
-      font-size: 13px;
+      font-size: 12px;
       color: #34d399;
-      background: rgba(16, 185, 129, 0.1);
+      background: rgba(16, 185, 129, 0.08);
       padding: 4px 10px;
       border-radius: 6px;
-      margin-left: auto;
+      border: 1px solid rgba(16,185,129,0.2);
+      white-space: nowrap;
+    }}
+    .no-results {{
+      text-align: center; padding: 60px; color: #475569;
+      font-size: 15px;
+    }}
+    .result-count {{
+      font-size: 12px; color: var(--text-muted);
+      padding: 0 4px 12px;
     }}
   </style>
 </head>
@@ -1235,71 +1394,131 @@ def export_html_dashboard(leads, html_path=DEFAULT_HTML_PATH):
   <div class="container">
     <header>
       <div class="title">
-        <h1>Startup Lead Tracker V2</h1>
-        <p>Active Hiring Intent, Scored Gigs & 1-Click Outreach Engine</p>
+        <h1>Lead Tracker <span>V3</span></h1>
+        <p>Student-focused gig finder &mdash; internships, contracts &amp; junior roles surfaced first</p>
       </div>
     </header>
 
     <div class="stats-bar" id="statsBar"></div>
 
-    <div class="controls">
+    <div class="toolbar">
       <div class="filter-group">
-        <button class="btn active" onclick="setFilter('all')">All Leads</button>
-        <button class="btn" onclick="setFilter('high')">High Fit (60+)</button>
-        <button class="btn" onclick="setFilter('contract')">Contract Only</button>
-        <button class="btn" onclick="setFilter('contact')">Has Direct Contact</button>
+        <button id="f-all" class="btn active" onclick="setFilter('all')">🌐 All</button>
+        <button id="f-internship" class="btn" onclick="setFilter('internship')">🎓 Internships</button>
+        <button id="f-contract" class="btn" onclick="setFilter('contract')">💼 Contract</button>
+        <button id="f-high" class="btn" onclick="setFilter('high')">⭐ High Fit</button>
+        <button id="f-contact" class="btn" onclick="setFilter('contact')">📞 Direct Contact</button>
       </div>
-      <input type="text" class="search-input" id="search" placeholder="Search keywords, stack, author..." oninput="render()">
+      <div class="sort-group">
+        <span style="font-size:12px;color:var(--text-muted);">Sort:</span>
+        <select class="sort-select" id="sortSelect" onchange="render()">
+          <option value="score">Highest Score</option>
+          <option value="posted">Newest Posted</option>
+          <option value="found">Newest Found</option>
+          <option value="score_asc">Lowest Score</option>
+        </select>
+      </div>
     </div>
 
+    <div class="toolbar" style="gap:12px;margin-top:-8px;margin-bottom:16px;">
+      <input type="text" class="search-input" id="search" placeholder="🔍  Search roles, companies, stack..." oninput="render()">
+      <div class="toggle-group">
+        <span class="toggle-label">Hide Senior Roles</span>
+        <label class="toggle-switch">
+          <input type="checkbox" id="hideSenior" onchange="render()">
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <div class="result-count" id="resultCount"></div>
     <div class="leads-grid" id="leadsGrid"></div>
   </div>
 
   <script>
     const leadsData = {leads_json};
     let currentFilter = 'all';
+    const SENIOR_RE = /\b(senior|sr\.|staff|principal|lead engineer|lead developer|director|vp of|vice president|head of engineering|head of product|architect|5\+\s*years|7\+\s*years|10\+\s*years)\b/i;
+    const JUNIOR_RE = /\b(intern|internship|junior|jr\.|entry.?level|student|new grad|apprentice|part.?time|fresh graduate)\b/i;
+
+    function isSenior(lead) {{
+      return SENIOR_RE.test(lead.title_or_role + ' ' + lead.summary_snippet);
+    }}
 
     function setFilter(filter) {{
       currentFilter = filter;
       document.querySelectorAll('.filter-group .btn').forEach(b => b.classList.remove('active'));
-      event.target.classList.add('active');
+      const btn = document.getElementById('f-' + filter);
+      if (btn) btn.classList.add('active');
       render();
     }}
 
     function copyToClipboard(text, btn) {{
       navigator.clipboard.writeText(text).then(() => {{
         const old = btn.innerText;
-        btn.innerText = 'Copied!';
-        setTimeout(() => btn.innerText = old, 1500);
+        btn.innerText = '✓ Copied!';
+        setTimeout(() => btn.innerText = old, 1600);
       }});
+    }}
+
+    function sortData(data) {{
+      const mode = document.getElementById('sortSelect').value;
+      const copy = [...data];
+      if (mode === 'score') return copy.sort((a,b) => (b.score||0)-(a.score||0));
+      if (mode === 'score_asc') return copy.sort((a,b) => (a.score||0)-(b.score||0));
+      if (mode === 'posted') return copy.sort((a,b) => (b.posted_at||'').localeCompare(a.posted_at||''));
+      if (mode === 'found') return copy.sort((a,b) => (b.found_at||'').localeCompare(a.found_at||''));
+      return copy;
+    }}
+
+    function buildChips(breakdown) {{
+      if (!breakdown) return '';
+      return breakdown.split('|').map(part => {{
+        const isPos = part.includes('+') && !part.startsWith('-');
+        const isNeg = part.includes('-') && !part.startsWith('Int');
+        const cls = isNeg ? 'chip-neg' : (isPos ? 'chip-pos' : 'chip-neutral');
+        return `<span class="chip ${{cls}}">${{part}}</span>`;
+      }}).join('');
     }}
 
     function render() {{
       const query = document.getElementById('search').value.toLowerCase();
-      const filtered = leadsData.filter(lead => {{
+      const hideSenior = document.getElementById('hideSenior').checked;
+
+      let filtered = leadsData.filter(lead => {{
+        if (hideSenior && isSenior(lead)) return false;
         if (currentFilter === 'high' && lead.score < 60) return false;
         if (currentFilter === 'contract' && lead.intent_type !== 'contract_hiring') return false;
+        if (currentFilter === 'internship' && lead.intent_type !== 'internship') return false;
         if (currentFilter === 'contact' && !lead.other_contact && !lead.domain) return false;
         if (query) {{
-          const hay = (lead.title_or_role + ' ' + lead.summary_snippet + ' ' + lead.company_or_author + ' ' + lead.source).toLowerCase();
+          const hay = (lead.title_or_role+' '+lead.summary_snippet+' '+lead.company_or_author+' '+lead.source).toLowerCase();
           if (!hay.includes(query)) return false;
         }}
         return true;
       }});
 
-      // Update stats
-      const highFitCount = leadsData.filter(l => l.score >= 60).length;
+      filtered = sortData(filtered);
+
+      // Stats bar
+      const highFit = leadsData.filter(l => l.score >= 60).length;
+      const internCount = leadsData.filter(l => l.intent_type === 'internship').length;
       const contactCount = leadsData.filter(l => l.other_contact || l.domain).length;
+      const contractCount = leadsData.filter(l => l.intent_type === 'contract_hiring').length;
       document.getElementById('statsBar').innerHTML = `
         <div class="stat-card"><div class="stat-val">${{leadsData.length}}</div><div class="stat-label">Total Leads</div></div>
-        <div class="stat-card"><div class="stat-val" style="color: #34d399">${{highFitCount}}</div><div class="stat-label">High-Fit Gigs (60+)</div></div>
-        <div class="stat-card"><div class="stat-val" style="color: #60a5fa">${{contactCount}}</div><div class="stat-label">With Direct Contact</div></div>
-        <div class="stat-card"><div class="stat-val">${{filtered.length}}</div><div class="stat-label">Showing Now</div></div>
+        <div class="stat-card"><div class="stat-val" style="color:#2dd4bf">${{internCount}}</div><div class="stat-label">🎓 Internships</div></div>
+        <div class="stat-card"><div class="stat-val" style="color:#34d399">${{highFit}}</div><div class="stat-label">⭐ High Fit (60+)</div></div>
+        <div class="stat-card"><div class="stat-val" style="color:#60a5fa">${{contractCount}}</div><div class="stat-label">💼 Contracts</div></div>
+        <div class="stat-card"><div class="stat-val" style="color:#c084fc">${{contactCount}}</div><div class="stat-label">📞 Direct Contact</div></div>
+        <div class="stat-card"><div class="stat-val">${{filtered.length}}</div><div class="stat-label">Showing</div></div>
       `;
+
+      document.getElementById('resultCount').textContent = `Showing ${{filtered.length}} of ${{leadsData.length}} leads`;
 
       const grid = document.getElementById('leadsGrid');
       if (filtered.length === 0) {{
-        grid.innerHTML = '<div style="text-align: center; padding: 48px; color: #94a3b8;">No leads match your filter.</div>';
+        grid.innerHTML = '<div class="no-results">🔍 No leads match your filter. Try adjusting the search or filter tabs.</div>';
         return;
       }}
 
@@ -1308,21 +1527,35 @@ def export_html_dashboard(leads, html_path=DEFAULT_HTML_PATH):
         if (lead.score >= 70) scoreClass = 'badge-score-high';
         else if (lead.score >= 50) scoreClass = 'badge-score-mid';
 
+        const isIntern = lead.intent_type === 'internship';
+        const isSeniorRole = isSenior(lead);
+        const cardClass = isIntern ? 'lead-card internship' : (isSeniorRole ? 'lead-card senior-role' : 'lead-card');
+
         const contact = lead.other_contact || lead.domain || '';
-        const safePitch = (lead.tailored_pitch || '').replace(/'/g, "\\\\'");
+        const safePitch = (lead.tailored_pitch || '').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\n/g,'\\n');
+        const chips = buildChips(lead.score_breakdown);
+
+        const actionBtn = isIntern
+          ? `<a href="${{lead.quick_action}}" target="_blank" class="btn-action btn-apply">🎓 Apply Now</a>`
+          : `<a href="${{lead.quick_action}}" target="_blank" class="btn-action btn-reachout">⚡ 1-Click Outreach</a>`;
 
         return `
-          <div class="lead-card">
+          <div class="${{cardClass}}">
             <div class="card-header">
-              <div>
-                <span class="badge ${{scoreClass}}" title="${{lead.score_breakdown || ''}}">${{lead.score}} PTS</span>
-                <span class="badge badge-source">${{lead.source}}</span>
-                <span class="badge" style="background: rgba(255,255,255,0.06); color:#94a3b8;">${{lead.intent_type}}</span>
-                <h2 class="card-title" style="margin-top: 8px;">${{lead.title_or_role}}</h2>
+              <div style="flex:1">
+                <div class="badges-row">
+                  <span class="badge ${{scoreClass}}">${{lead.score}} PTS</span>
+                  <span class="badge badge-source">${{lead.source}}</span>
+                  ${{isIntern ? '<span class="badge badge-internship">🎓 INTERN</span>' : ''}}
+                  ${{isSeniorRole ? '<span class="badge badge-senior">⚠ SENIOR</span>' : ''}}
+                  <span class="badge" style="background:rgba(255,255,255,0.05);color:#64748b;border:1px solid rgba(255,255,255,0.07);">${{lead.intent_type}}</span>
+                </div>
+                <div class="score-breakdown">${{chips}}</div>
+                <h2 class="card-title" style="margin-top:8px">${{lead.title_or_role}}</h2>
                 <div class="card-meta">
-                  <span>Author/Company: <strong>${{lead.company_or_author}}</strong></span>
-                  <span>Posted: <strong>${{lead.posted_at || 'Recent'}}</strong></span>
-                  <span>Found: <strong>${{lead.found_at}}</strong></span>
+                  <span>🏢 <strong>${{lead.company_or_author}}</strong></span>
+                  <span>📅 Posted: <strong>${{lead.posted_at || 'Recent'}}</strong></span>
+                  <span>🔍 Found: <strong>${{lead.found_at}}</strong></span>
                 </div>
               </div>
               ${{contact ? `<span class="contact-tag">📞 ${{contact.split(';')[0]}}</span>` : ''}}
@@ -1332,15 +1565,15 @@ def export_html_dashboard(leads, html_path=DEFAULT_HTML_PATH):
 
             <div class="pitch-box">
               <div class="pitch-header">
-                <span>🎯 Tailored Cold Pitch Hook</span>
-                <button class="btn btn-copy" style="padding: 2px 8px; font-size: 11px;" onclick="copyToClipboard('${{safePitch}}', this)">Copy Pitch</button>
+                <span>${{isIntern ? '✉️ Student Cover Letter Intro' : '🎯 Tailored Pitch Hook'}}</span>
+                <button class="btn-action btn-copy" style="padding:3px 10px;font-size:11px;" onclick="copyToClipboard('${{safePitch}}', this)">Copy</button>
               </div>
-              <div class="pitch-text">"${{lead.tailored_pitch || ''}}"</div>
+              <div class="pitch-text">&ldquo;${{lead.tailored_pitch || ''}}&rdquo;</div>
             </div>
 
             <div class="card-actions">
-              <a href="${{lead.quick_action}}" target="_blank" class="btn-action btn-reachout">⚡ 1-Click Outreach</a>
-              <a href="${{lead.article_link}}" target="_blank" class="btn-action btn-link">View Original Post ↗</a>
+              ${{actionBtn}}
+              <a href="${{lead.article_link}}" target="_blank" class="btn-action btn-link">View Post ↗</a>
             </div>
           </div>
         `;
@@ -1399,9 +1632,14 @@ def main():
         action="store_true",
         help="Also scan African tech funding/launch news feeds (Techpoint, TechCabal)",
     )
+    parser.add_argument(
+        "--no-internships",
+        action="store_true",
+        help="Disable intern-list.com scraping",
+    )
     args = parser.parse_args()
 
-    print(f"=== Startup Lead Tracker V2 (Lookback: {args.days} days, Min Score: {args.min_score}) ===")
+    print(f"=== Startup Lead Tracker V3 (Lookback: {args.days} days, Min Score: {args.min_score}) ===")
 
     all_leads = []
 
@@ -1435,6 +1673,12 @@ def main():
         news_leads = scan_news_sources(args.days)
         print(f"   Found {len(news_leads)} news articles.")
         all_leads += news_leads
+
+    if not args.no_internships:
+        print("7. Scanning intern-list.com (SWE, Data Analysis, AI/ML)...")
+        intern_leads = scan_intern_list(args.days)
+        print(f"   Found {len(intern_leads)} internship listings.")
+        all_leads += intern_leads
 
     new_saved, final_out = append_leads(args.out, all_leads, min_score=args.min_score)
 
