@@ -36,6 +36,8 @@ import json
 import os
 import re
 import shutil
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from html import escape, unescape
 from urllib.parse import quote, urlparse
@@ -50,6 +52,7 @@ import requests
 DEFAULT_DAYS_BACK = 7
 DEFAULT_MIN_SCORE = 20
 DEFAULT_CSV_PATH = "leads.csv"
+DEFAULT_JSON_PATH = "leads.json"
 DEFAULT_HTML_PATH = "leads.html"
 
 GENERIC_EXCLUDE_DOMAINS = {
@@ -96,28 +99,28 @@ HN_ALGOLIA_SEARCH = "https://hn.algolia.com/api/v1/search"
 
 HTTP_TIMEOUT = 12
 DEFAULT_HEADERS = {
-    "User-Agent": "StartupLeadTracker/3.0 (lead-generation-automation; +https://github.com)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 REDDIT_HEADERS = {
-    "User-Agent": "python:StartupLeadTracker:v3.0 (by /u/dev_lead_tracker)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Intern-list.com Airtable shared-view embed IDs
-INTERN_LIST_EMBEDS = [
+# Live verified intern-list.com Airtable shared-view embeds by track
+INTERN_LIST_SOURCES = [
     {
-        "name": "InternList (SWE)",
-        "app_id": "app17F0kkWQZhC6HB",
-        "share_id": "shrOTtndhc6HSgnYb",
+        "category": "InternList (SWE)",
+        "embed_url": "https://airtable.com/embed/app17F0kkWQZhC6HB/shrOTtndhc6HSgnYb?viewControls=on",
     },
     {
-        "name": "InternList (Data)",
-        "app_id": "appbsiP1flCoaXCSm",
-        "share_id": "shreRS1cFLbduwBaU",
+        "category": "InternList (Data)",
+        "embed_url": "https://airtable.com/embed/appbsiP1flCoaXCSm/shreRS1cFLbduwBaU?viewControls=on",
     },
     {
-        "name": "InternList (AI/ML)",
-        "app_id": "appjSXAWiVF4d1HoZ",
-        "share_id": "shrf04yGbrK3IebAl",
+        "category": "InternList (AI/ML)",
+        "embed_url": "https://airtable.com/embed/appjSXAWiVF4d1HoZ/shrf04yGbrK3IebAl?viewControls=on",
     },
 ]
 
@@ -215,23 +218,38 @@ def guess_emails(domain):
     return [f"{prefix}@{domain}" for prefix in EMAIL_PREFIXES]
 
 
+_GITHUB_CACHE = {}
+_GITHUB_CALL_COUNT = 0
+_GITHUB_MAX_CALLS = 10
+_GITHUB_RATE_LIMITED = False
+
+
 def resolve_github_owner_contact(url):
+    global _GITHUB_CALL_COUNT, _GITHUB_RATE_LIMITED
     match = re.search(r"github\.com/([^/]+)/?", url)
     if not match:
         return {}
     owner = match.group(1).strip()
-    if not owner or owner.lower() in ["topics", "features", "explore"]:
+    if not owner or owner.lower() in ["topics", "features", "explore", "site", "orgs", "about"]:
         return {}
 
+    if owner in _GITHUB_CACHE:
+        return _GITHUB_CACHE[owner]
+
     result = {"github_profile": f"https://github.com/{owner}"}
+    if _GITHUB_RATE_LIMITED or _GITHUB_CALL_COUNT >= _GITHUB_MAX_CALLS:
+        _GITHUB_CACHE[owner] = result
+        return result
+
     try:
+        _GITHUB_CALL_COUNT += 1
         resp = requests.get(
             GITHUB_API_BASE + owner,
             headers={
-                "User-Agent": "StartupLeadTracker/2.0",
+                "User-Agent": "StartupLeadTracker/3.0",
                 "Accept": "application/vnd.github+json",
             },
-            timeout=8,
+            timeout=2.0,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -246,8 +264,12 @@ def resolve_github_owner_contact(url):
                 result["public_email"] = data["email"]
             if data.get("twitter_username"):
                 result["twitter"] = f"https://twitter.com/{data['twitter_username']}"
+        elif resp.status_code in (403, 429):
+            _GITHUB_RATE_LIMITED = True
     except Exception:
         pass
+
+    _GITHUB_CACHE[owner] = result
     return result
 
 
@@ -883,14 +905,19 @@ def scan_reddit_hiring(days_back):
         },
         {
             "name": "Reddit (r/SideProject)",
-            "url": "https://www.reddit.com/r/SideProject/new.rss",
+            "url": "https://www.reddit.com/r/SideProject/search.rss?q=python+OR+developer+OR+scraper&restrict_sr=on&sort=new&t=all",
             "intent": "discovery",
         },
     ]
 
-    for feed_info in feeds:
+    session = requests.Session()
+    session.headers.update(REDDIT_HEADERS)
+
+    for i, feed_info in enumerate(feeds):
         try:
-            resp = requests.get(feed_info["url"], headers=REDDIT_HEADERS, timeout=HTTP_TIMEOUT)
+            if i > 0:
+                time.sleep(1.2)
+            resp = session.get(feed_info["url"], timeout=HTTP_TIMEOUT)
             if resp.status_code != 200:
                 print(f"  [{feed_info['name']}] HTTP {resp.status_code}")
                 continue
@@ -1015,6 +1042,143 @@ def scan_news_sources(days_back):
             lead["tailored_pitch"] = pitch
             lead["quick_action"] = generate_quick_action_link(lead, pitch)
             leads.append(lead)
+
+    return leads
+
+def _find_first(d, *candidate_keys):
+    """Case-insensitive lookup of the first present key in a row dict."""
+    lower_map = {k.lower(): v for k, v in d.items()}
+    for key in candidate_keys:
+        if key.lower() in lower_map:
+            return lower_map[key.lower()]
+    return None
+
+
+def _scrape_airtable_category(session, category_info, cutoff_dt):
+    """
+    Scrapes an individual Airtable embed for a specific category track.
+    Hydrates view parameters and fetches nested shared view records with column mapping.
+    """
+    leads = []
+    category_name = category_info["category"]
+    embed_url = category_info["embed_url"]
+
+    try:
+        embed_resp = session.get(embed_url, timeout=HTTP_TIMEOUT)
+        embed_resp.raise_for_status()
+    except Exception as e:
+        print(f"  [{category_name}] Could not load embed page ({e}). Skipping.")
+        return leads
+
+    match = re.search(r"window\.initData\s*=\s*(\{.*?\});\s*(?:window|\n|<|performance)", embed_resp.text, re.DOTALL)
+    if not match:
+        print(f"  [{category_name}] Could not extract initData from embed HTML. Skipping.")
+        return leads
+
+    try:
+        init_data = json.loads(match.group(1))
+    except Exception as e:
+        print(f"  [{category_name}] Failed to parse embed JSON ({e}). Skipping.")
+        return leads
+
+    app_id = init_data.get("singleApplicationId") or list(init_data.get("rawApplications", {}).keys())[0]
+    view_id = init_data.get("sharedViewId")
+    access_policy = init_data.get("accessPolicy")
+
+    if not view_id:
+        print(f"  [{category_name}] Missing sharedViewId in payload. Skipping.")
+        return leads
+
+    api_url = f"https://airtable.com/v0.3/view/{view_id}/readSharedViewData"
+    params = {
+        "stringifiedObjectParams": json.dumps({"shouldUseNestedResponseFormat": True}),
+        "requestId": "req_leadtracker",
+        "accessPolicy": access_policy if isinstance(access_policy, str) else json.dumps(access_policy),
+    }
+    api_headers = {
+        "X-Airtable-Application-Id": app_id,
+        "X-Time-Zone": "America/New_York",
+        "X-User-Locale": "en",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": embed_url,
+    }
+
+    try:
+        api_resp = session.get(api_url, params=params, headers=api_headers, timeout=HTTP_TIMEOUT)
+        api_resp.raise_for_status()
+        payload = api_resp.json()
+    except Exception as e:
+        print(f"  [{category_name}] readSharedViewData failed ({e}). Skipping.")
+        return leads
+
+    table = payload.get("data", {}).get("table", {})
+    cols_by_id = {c["id"]: c.get("name", "") for c in table.get("columns", [])}
+    rows = table.get("rows", [])
+
+    for row in rows:
+        cell_values = row.get("cellValuesByColumnId", {})
+        named_cells = {cols_by_id.get(cid, cid): val for cid, val in cell_values.items()}
+
+        title = _find_first(named_cells, "Position Title", "Title", "Role", "Job Title") or ""
+        company = _find_first(named_cells, "Company", "Company Name", "Employer") or "Unknown Company"
+        date_added = _find_first(named_cells, "Date", "Date Added", "Date Posted", "Posted", "Created")
+        work_model = _find_first(named_cells, "Work Model", "Remote/Hybrid/In-Person", "Location Type") or ""
+        location = _find_first(named_cells, "Location", "City", "State") or ""
+        salary = _find_first(named_cells, "Salary", "Compensation", "Pay") or ""
+        qualifications = _find_first(named_cells, "Qualifications", "Requirements", "Description") or ""
+        apply_raw = _find_first(named_cells, "Apply", "Application URL", "Apply Link", "URL", "Link") or ""
+        apply_url = apply_raw.get("url") if isinstance(apply_raw, dict) else str(apply_raw or "")
+
+        if not title:
+            continue
+
+        posted_date = format_date(date_added) if date_added else None
+        if posted_date:
+            try:
+                if datetime.strptime(posted_date, "%Y-%m-%d").replace(tzinfo=timezone.utc) < cutoff_dt:
+                    continue
+            except ValueError:
+                pass
+
+        snippet_bits = [b for b in [work_model, location, salary, qualifications] if b]
+        summary_snippet = " | ".join(str(b) for b in snippet_bits)[:350]
+
+        lead = {
+            "intent_type": "internship",
+            "posted_at": posted_date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "found_at": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "source": category_name,
+            "company_or_author": str(company),
+            "title_or_role": str(title)[:150],
+            "domain": "",
+            "guessed_emails": "",
+            "other_contact": "",
+            "summary_snippet": summary_snippet,
+            "article_link": str(apply_url) or embed_url,
+        }
+        score, breakdown = calculate_lead_score(lead)
+        lead["score"] = score
+        lead["score_breakdown"] = breakdown
+        pitch = generate_tailored_pitch(lead)
+        lead["tailored_pitch"] = pitch
+        lead["quick_action"] = apply_url or generate_quick_action_link(lead, pitch)
+        leads.append(lead)
+
+    return leads
+
+
+def scan_intern_list(days_back=30):
+    """
+    Scrapes verified category tracks (SWE, Data Analysis, AI/ML) from intern-list.com.
+    """
+    leads = []
+    cutoff_dt = cutoff_datetime(days_back)
+    session = requests.Session()
+    session.headers.update(DEFAULT_HEADERS)
+
+    for cat_info in INTERN_LIST_SOURCES:
+        cat_leads = _scrape_airtable_category(session, cat_info, cutoff_dt)
+        leads.extend(cat_leads)
 
     return leads
 
@@ -1438,8 +1602,8 @@ def export_html_dashboard(leads, html_path=DEFAULT_HTML_PATH):
   <script>
     const leadsData = {leads_json};
     let currentFilter = 'all';
-    const SENIOR_RE = /\b(senior|sr\.|staff|principal|lead engineer|lead developer|director|vp of|vice president|head of engineering|head of product|architect|5\+\s*years|7\+\s*years|10\+\s*years)\b/i;
-    const JUNIOR_RE = /\b(intern|internship|junior|jr\.|entry.?level|student|new grad|apprentice|part.?time|fresh graduate)\b/i;
+    const SENIOR_RE = /\\b(senior|sr\\.|staff|principal|lead engineer|lead developer|director|vp of|vice president|head of engineering|head of product|architect|5\\+\\s*years|7\\+\\s*years|10\\+\\s*years)\\b/i;
+    const JUNIOR_RE = /\\b(intern|internship|junior|jr\\.|entry.?level|student|new grad|apprentice|part.?time|fresh graduate)\\b/i;
 
     function isSenior(lead) {{
       return SENIOR_RE.test(lead.title_or_role + ' ' + lead.summary_snippet);
@@ -1532,7 +1696,7 @@ def export_html_dashboard(leads, html_path=DEFAULT_HTML_PATH):
         const cardClass = isIntern ? 'lead-card internship' : (isSeniorRole ? 'lead-card senior-role' : 'lead-card');
 
         const contact = lead.other_contact || lead.domain || '';
-        const safePitch = (lead.tailored_pitch || '').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\n/g,'\\n');
+        const safePitch = (lead.tailored_pitch || '').replace(/\\\\/g,'\\\\\\\\').replace(/'/g,"\\\\'").replace(/\\n/g,'\\\\n');
         const chips = buildChips(lead.score_breakdown);
 
         const actionBtn = isIntern
@@ -1566,9 +1730,9 @@ def export_html_dashboard(leads, html_path=DEFAULT_HTML_PATH):
             <div class="pitch-box">
               <div class="pitch-header">
                 <span>${{isIntern ? '✉️ Student Cover Letter Intro' : '🎯 Tailored Pitch Hook'}}</span>
-                <button class="btn-action btn-copy" style="padding:3px 10px;font-size:11px;" onclick="copyToClipboard('${{safePitch}}', this)">Copy</button>
+                <button class="btn-action btn-copy" style="padding:3px 10px;font-size:11px;" onclick="copyLeadPitch(${{idx}}, this)">Copy</button>
               </div>
-              <div class="pitch-text">&ldquo;${{lead.tailored_pitch || ''}}&rdquo;</div>
+              <div class="pitch-text">&ldquo;${{escapeHtml(lead.tailored_pitch || '')}}&rdquo;</div>
             </div>
 
             <div class="card-actions">
@@ -1580,6 +1744,57 @@ def export_html_dashboard(leads, html_path=DEFAULT_HTML_PATH):
       }}).join('');
     }}
 
+    function escapeHtml(str) {{
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }}
+
+    function copyLeadPitch(idx, btn) {{
+      const lead = filteredLeadsCache[idx];
+      const pitch = (lead && lead.tailored_pitch) || '';
+      if (!pitch) return;
+      navigator.clipboard.writeText(pitch).then(() => {{
+        const oldText = btn.textContent;
+        btn.textContent = 'Copied!';
+        btn.style.borderColor = '#10b981';
+        btn.style.color = '#34d399';
+        setTimeout(() => {{
+          btn.textContent = oldText;
+          btn.style.borderColor = '';
+          btn.style.color = '';
+        }}, 1800);
+      }}).catch(err => {{
+        prompt('Copy pitch manually:', pitch);
+      }});
+    }}
+
+    let filteredLeadsCache = [];
+    const origRender = render;
+    render = function() {{
+      const sortVal = document.getElementById('sortSelect').value;
+      const seniorToggle = document.getElementById('hideSeniorToggle').checked;
+      const search = document.getElementById('searchInput').value.toLowerCase().trim();
+
+      filteredLeadsCache = leadsData.filter(lead => {{
+        if (seniorToggle && isSenior(lead)) return false;
+        if (currentFilter === 'high' && lead.score < 70) return false;
+        if (currentFilter === 'contract' && lead.intent_type !== 'contract_hiring') return false;
+        if (currentFilter === 'intern' && lead.intent_type !== 'internship') return false;
+        if (currentFilter === 'contact' && !lead.domain && !lead.other_contact) return false;
+        if (search) {{
+          const hay = `${{lead.company_or_author}} ${{lead.title_or_role}} ${{lead.domain}} ${{lead.summary_snippet}} ${{lead.source}}`.toLowerCase();
+          if (!hay.includes(search)) return false;
+        }}
+        return true;
+      }});
+
+      origRender();
+    }};
+
     render();
   </script>
 </body>
@@ -1588,6 +1803,27 @@ def export_html_dashboard(leads, html_path=DEFAULT_HTML_PATH):
 
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html_content)
+
+
+def export_json_leads(leads, json_path=DEFAULT_JSON_PATH):
+    """
+    Exports structured leads to JSON for modern web dashboards.
+    Also syncs to dashboard/public/leads.json if available.
+    """
+    sorted_leads = sorted(leads, key=lambda x: x.get("score", 0), reverse=True)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(sorted_leads, f, indent=2, ensure_ascii=False)
+
+    for sub in ["public", "dist"]:
+        dashboard_dir = os.path.join("dashboard", sub)
+        if os.path.exists(dashboard_dir):
+            target = os.path.join(dashboard_dir, "leads.json")
+            try:
+                shutil.copyfile(json_path, target)
+            except Exception:
+                pass
+
+    return json_path
 
 
 # ---------------------------------------------------------------------------
@@ -1617,6 +1853,12 @@ def main():
         help=f"CSV file to append results to (default: {DEFAULT_CSV_PATH})",
     )
     parser.add_argument(
+        "--json",
+        type=str,
+        default=DEFAULT_JSON_PATH,
+        help=f"JSON file to export leads to (default: {DEFAULT_JSON_PATH})",
+    )
+    parser.add_argument(
         "--html",
         type=str,
         default=DEFAULT_HTML_PATH,
@@ -1637,70 +1879,77 @@ def main():
         action="store_true",
         help="Disable intern-list.com scraping",
     )
+    parser.add_argument(
+        "--sequential",
+        action="store_true",
+        help="Run scrapers sequentially instead of concurrently",
+    )
     args = parser.parse_args()
 
     print(f"=== Startup Lead Tracker V3 (Lookback: {args.days} days, Min Score: {args.min_score}) ===")
 
     all_leads = []
 
-    print("\n1. Scanning Hacker News 'Who is hiring?'...")
-    hn_hiring = scan_hn_who_is_hiring(args.days)
-    print(f"   Found {len(hn_hiring)} job postings.")
-    all_leads += hn_hiring
-
-    print("2. Scanning Hacker News 'Seeking freelancer?'...")
-    hn_freelance = scan_hn_seeking_freelancer(args.days)
-    print(f"   Found {len(hn_freelance)} freelance seeker posts.")
-    all_leads += hn_freelance
-
-    print("3. Scanning targeted Hacker News hiring comments...")
-    hn_queries = scan_hn_hiring_queries(args.days)
-    print(f"   Found {len(hn_queries)} direct developer searches.")
-    all_leads += hn_queries
-
-    print("4. Scanning Reddit hiring RSS feeds (r/forhire, r/jobbit, r/SideProject)...")
-    reddit_leads = scan_reddit_hiring(args.days)
-    print(f"   Found {len(reddit_leads)} Reddit posts.")
-    all_leads += reddit_leads
-
-    print("5. Scanning Hacker News Show HN...")
-    show_hn_leads = scan_show_hn(args.days)
-    print(f"   Found {len(show_hn_leads)} Show HN launches.")
-    all_leads += show_hn_leads
-
+    tasks = [
+        ("HN 'Who is hiring?'", lambda: scan_hn_who_is_hiring(args.days)),
+        ("HN 'Seeking freelancer?'", lambda: scan_hn_seeking_freelancer(args.days)),
+        ("Targeted HN Comments", lambda: scan_hn_hiring_queries(args.days)),
+        ("Reddit Hiring Feeds", lambda: scan_reddit_hiring(args.days)),
+        ("Show HN Launches", lambda: scan_show_hn(args.days)),
+    ]
     if args.include_news:
-        print("6. Scanning African tech news feeds...")
-        news_leads = scan_news_sources(args.days)
-        print(f"   Found {len(news_leads)} news articles.")
-        all_leads += news_leads
-
+        tasks.append(("African Tech News", lambda: scan_news_sources(args.days)))
     if not args.no_internships:
-        print("7. Scanning intern-list.com (SWE, Data Analysis, AI/ML)...")
-        intern_leads = scan_intern_list(args.days)
-        print(f"   Found {len(intern_leads)} internship listings.")
-        all_leads += intern_leads
+        tasks.append(("InternList (SWE/Data/AI)", lambda: scan_intern_list(args.days)))
+
+    if args.sequential:
+        print("\n[Running sequentially]")
+        for name, fn in tasks:
+            print(f"  Scanning {name}...")
+            res = fn()
+            print(f"  -> Found {len(res)} items.")
+            all_leads.extend(res)
+    else:
+        print(f"\n[Running {len(tasks)} scrapers concurrently]")
+        with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+            future_to_name = {executor.submit(fn): name for name, fn in tasks}
+            for future in as_completed(future_to_name):
+                name = future_to_name[future]
+                try:
+                    res = future.result()
+                    print(f"  [DONE] {name}: {len(res)} leads found.")
+                    all_leads.extend(res)
+                except Exception as e:
+                    print(f"  [ERROR] {name}: {e}")
 
     new_saved, final_out = append_leads(args.out, all_leads, min_score=args.min_score)
+
+    # Read all aggregated leads from CSV for JSON & HTML export
+    aggregated_leads = []
+    target_csv = final_out if os.path.exists(final_out) else args.out
+    if os.path.exists(target_csv):
+        with open(target_csv, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                try:
+                    r["score"] = int(r.get("score", 0))
+                except ValueError:
+                    r["score"] = 0
+                aggregated_leads.append(r)
+
+    # Export JSON
+    final_json = export_json_leads(aggregated_leads, json_path=args.json)
+
+    # Export HTML
+    if not args.no_html:
+        export_html_dashboard(aggregated_leads, html_path=args.html)
+        print(f"Interactive outreach dashboard generated: {args.html}")
 
     print("\n" + "=" * 60)
     print(f"Total leads retrieved across sources: {len(all_leads)}")
     print(f"Leads meeting min-score (>={args.min_score}) & newly saved: {len(new_saved)}")
-    print(f"Output saved to CSV: {final_out}")
-
-    if not args.no_html:
-        dashboard_leads = []
-        target_csv = final_out if os.path.exists(final_out) else args.out
-        if os.path.exists(target_csv):
-            with open(target_csv, newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for r in reader:
-                    try:
-                        r["score"] = int(r.get("score", 0))
-                    except ValueError:
-                        r["score"] = 0
-                    dashboard_leads.append(r)
-        export_html_dashboard(dashboard_leads, html_path=args.html)
-        print(f"Interactive outreach dashboard generated: {args.html}")
+    print(f"Output saved to CSV:  {final_out}")
+    print(f"Output saved to JSON: {final_json}")
 
     high_score = [l for l in new_saved if l["score"] >= 60]
     with_contact = [l for l in new_saved if l["domain"] or l["other_contact"]]
